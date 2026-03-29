@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 use chrono::{NaiveTime, Weekday};
 use serde::Deserialize;
@@ -91,6 +90,14 @@ impl Schedule {
     }
 }
 
+pub struct GtfsCsvs {
+    pub routes: String,
+    pub trips: String,
+    pub stop_times: String,
+    pub stops: String,
+    pub calendar: String,
+}
+
 fn parse_gtfs_time(s: &str) -> Option<NaiveTime> {
     let parts: Vec<&str> = s.trim().split(':').collect();
     if parts.len() != 3 {
@@ -108,32 +115,23 @@ fn format_time_hhmm(t: NaiveTime) -> String {
     t.format("%H:%M").to_string()
 }
 
-pub fn load_schedule(config: &Config) -> Result<Schedule, Box<dyn std::error::Error>> {
-    let dir = &config.gtfs_dir;
-
-    // Load route info
-    let route_info = load_route_info(dir, &config.route_id)?;
-
-    // Load station name
-    let station_name = load_station_name(dir, &config.stop_id)?;
-
-    // Load calendar to map service_id -> active weekdays
-    let service_weekdays = load_calendar(dir)?;
-
-    // Load trips for this route + direction, collecting trip_ids grouped by service_id
+pub fn load_schedule(
+    config: &Config,
+    csvs: &GtfsCsvs,
+) -> Result<Schedule, Box<dyn std::error::Error>> {
+    let route_info = load_route_info(&csvs.routes, &config.route_id)?;
+    let station_name = load_station_name(&csvs.stops, &config.stop_id)?;
+    let service_weekdays = load_calendar(&csvs.calendar)?;
     let (trips_by_service, headsign) =
-        load_trips(dir, &config.route_id, config.direction_id)?;
+        load_trips(&csvs.trips, &config.route_id, config.direction_id)?;
 
-    // Build set of all relevant trip_ids
     let all_trip_ids: HashSet<&str> = trips_by_service
         .values()
         .flat_map(|ids| ids.iter().map(String::as_str))
         .collect();
 
-    // Load stop_times for relevant trips at our stop
-    let stop_times = load_stop_times(dir, &all_trip_ids, &config.stop_id)?;
+    let stop_times = load_stop_times(&csvs.stop_times, &all_trip_ids, &config.stop_id)?;
 
-    // Build departures grouped by weekday
     let mut departures_by_weekday: HashMap<Weekday, Vec<ScheduledDeparture>> = HashMap::new();
 
     for (service_id, trip_ids) in &trips_by_service {
@@ -157,7 +155,6 @@ pub fn load_schedule(config: &Config) -> Result<Schedule, Box<dyn std::error::Er
         }
     }
 
-    // Sort each weekday's departures by time
     for deps in departures_by_weekday.values_mut() {
         deps.sort_by_key(|d| d.departure_time);
     }
@@ -170,8 +167,8 @@ pub fn load_schedule(config: &Config) -> Result<Schedule, Box<dyn std::error::Er
     })
 }
 
-fn load_route_info(dir: &Path, route_id: &str) -> Result<RouteInfo, Box<dyn std::error::Error>> {
-    let mut rdr = csv::Reader::from_path(dir.join("routes.txt"))?;
+fn load_route_info(csv_data: &str, route_id: &str) -> Result<RouteInfo, Box<dyn std::error::Error>> {
+    let mut rdr = csv::Reader::from_reader(csv_data.as_bytes());
     for result in rdr.deserialize() {
         let route: GtfsRoute = result?;
         if route.route_id == route_id {
@@ -184,9 +181,8 @@ fn load_route_info(dir: &Path, route_id: &str) -> Result<RouteInfo, Box<dyn std:
     Err(format!("Route {} not found", route_id).into())
 }
 
-fn load_station_name(dir: &Path, stop_id: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let mut rdr = csv::Reader::from_path(dir.join("stops.txt"))?;
-    // First try to find the stop itself, then use its parent station name if available
+fn load_station_name(csv_data: &str, stop_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut rdr = csv::Reader::from_reader(csv_data.as_bytes());
     let mut stop_name = None;
     let mut parent_id = None;
     let mut parent_names: HashMap<String, String> = HashMap::new();
@@ -200,7 +196,6 @@ fn load_station_name(dir: &Path, stop_id: &str) -> Result<String, Box<dyn std::e
         parent_names.insert(stop.stop_id.clone(), stop.stop_name);
     }
 
-    // Prefer parent station name (cleaner display)
     if let Some(pid) = parent_id {
         if let Some(name) = parent_names.get(&pid) {
             return Ok(name.clone());
@@ -211,9 +206,9 @@ fn load_station_name(dir: &Path, stop_id: &str) -> Result<String, Box<dyn std::e
 }
 
 fn load_calendar(
-    dir: &Path,
+    csv_data: &str,
 ) -> Result<HashMap<String, Vec<Weekday>>, Box<dyn std::error::Error>> {
-    let mut rdr = csv::Reader::from_path(dir.join("calendar.txt"))?;
+    let mut rdr = csv::Reader::from_reader(csv_data.as_bytes());
     let mut map = HashMap::new();
 
     for result in rdr.deserialize() {
@@ -233,11 +228,11 @@ fn load_calendar(
 }
 
 fn load_trips(
-    dir: &Path,
+    csv_data: &str,
     route_id: &str,
     direction_id: u8,
 ) -> Result<(HashMap<String, Vec<String>>, String), Box<dyn std::error::Error>> {
-    let mut rdr = csv::Reader::from_path(dir.join("trips.txt"))?;
+    let mut rdr = csv::Reader::from_reader(csv_data.as_bytes());
     let mut trips_by_service: HashMap<String, Vec<String>> = HashMap::new();
     let mut headsign = String::new();
 
@@ -258,11 +253,11 @@ fn load_trips(
 }
 
 fn load_stop_times(
-    dir: &Path,
+    csv_data: &str,
     trip_ids: &HashSet<&str>,
     stop_id: &str,
 ) -> Result<HashMap<String, (NaiveTime, String)>, Box<dyn std::error::Error>> {
-    let mut rdr = csv::Reader::from_path(dir.join("stop_times.txt"))?;
+    let mut rdr = csv::Reader::from_reader(csv_data.as_bytes());
     let mut map = HashMap::new();
 
     for result in rdr.deserialize() {

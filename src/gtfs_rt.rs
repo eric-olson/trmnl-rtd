@@ -1,6 +1,7 @@
 use chrono::{DateTime, TimeZone};
 use chrono_tz::America::Denver;
 use prost::Message;
+use worker::*;
 
 use crate::config::Config;
 
@@ -9,6 +10,9 @@ pub mod transit_realtime {
 }
 
 use transit_realtime::FeedMessage;
+
+// Re-alias so we can use both worker::Result and std Result
+type StdResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Debug)]
 pub struct RealtimeDeparture {
@@ -28,19 +32,19 @@ pub struct RealtimeData {
     pub alerts: Vec<Alert>,
 }
 
-pub async fn fetch_realtime(config: &Config) -> Result<RealtimeData, Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
+pub async fn fetch_realtime(config: &Config) -> Result<RealtimeData> {
+    let trip_req = Request::new(&config.trip_update_url, Method::Get)?;
+    let mut trip_resp = Fetch::Request(trip_req).send().await?;
+    let trip_bytes = trip_resp.bytes().await?;
 
-    let (trip_updates_resp, alerts_resp) = tokio::join!(
-        client.get(&config.trip_update_url).send(),
-        client.get(&config.alerts_url).send(),
-    );
+    let alert_req = Request::new(&config.alerts_url, Method::Get)?;
+    let mut alert_resp = Fetch::Request(alert_req).send().await?;
+    let alert_bytes = alert_resp.bytes().await?;
 
-    let trip_updates_bytes = trip_updates_resp?.bytes().await?;
-    let alerts_bytes = alerts_resp?.bytes().await?;
-
-    let departures = parse_trip_updates(&trip_updates_bytes, config)?;
-    let alerts = parse_alerts(&alerts_bytes, config)?;
+    let departures = parse_trip_updates(&trip_bytes, config)
+        .map_err(|e| Error::RustError(e.to_string()))?;
+    let alerts = parse_alerts(&alert_bytes, config)
+        .map_err(|e| Error::RustError(e.to_string()))?;
 
     Ok(RealtimeData {
         departures,
@@ -48,10 +52,7 @@ pub async fn fetch_realtime(config: &Config) -> Result<RealtimeData, Box<dyn std
     })
 }
 
-fn parse_trip_updates(
-    bytes: &[u8],
-    config: &Config,
-) -> Result<Vec<RealtimeDeparture>, Box<dyn std::error::Error>> {
+fn parse_trip_updates(bytes: &[u8], config: &Config) -> StdResult<Vec<RealtimeDeparture>> {
     let feed = FeedMessage::decode(bytes)?;
     let mut departures = Vec::new();
 
@@ -110,10 +111,7 @@ fn parse_trip_updates(
     Ok(departures)
 }
 
-fn parse_alerts(
-    bytes: &[u8],
-    config: &Config,
-) -> Result<Vec<Alert>, Box<dyn std::error::Error>> {
+fn parse_alerts(bytes: &[u8], config: &Config) -> StdResult<Vec<Alert>> {
     let feed = FeedMessage::decode(bytes)?;
     let mut alerts = Vec::new();
 

@@ -1,5 +1,6 @@
 mod config;
 mod gtfs_rt;
+mod refresh;
 mod schedule;
 
 use std::collections::HashMap;
@@ -7,8 +8,10 @@ use std::collections::HashMap;
 use chrono::{Datelike, Utc};
 use chrono_tz::America::Denver;
 use serde::Serialize;
+use worker::*;
 
 use config::Config;
+use schedule::GtfsCsvs;
 
 #[derive(Serialize)]
 struct Output {
@@ -34,11 +37,34 @@ struct AlertOutput {
     description: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::from_env();
+/// Load the GTFS CSV files from the R2 bucket.
+async fn load_gtfs_csvs(bucket: &Bucket) -> Result<GtfsCsvs> {
+    async fn get_csv(bucket: &Bucket, name: &str) -> Result<String> {
+        let obj = bucket.get(name).execute().await?
+            .ok_or_else(|| Error::RustError(format!("{} not found in R2 — run GTFS refresh first", name)))?;
+        obj.body()
+            .ok_or_else(|| Error::RustError(format!("{} has no body", name)))?
+            .text()
+            .await
+    }
 
-    let schedule = schedule::load_schedule(&config)?;
+    Ok(GtfsCsvs {
+        routes: get_csv(bucket, "routes.txt").await?,
+        trips: get_csv(bucket, "trips.txt").await?,
+        stop_times: get_csv(bucket, "stop_times.txt").await?,
+        stops: get_csv(bucket, "stops.txt").await?,
+        calendar: get_csv(bucket, "calendar.txt").await?,
+    })
+}
+
+/// Main logic: load schedule from R2, fetch realtime data, merge and return JSON output.
+async fn run(env: &Env) -> Result<Output> {
+    let config = Config::from_env(env);
+    let bucket = env.bucket("GTFS_BUCKET")?;
+
+    let csvs = load_gtfs_csvs(&bucket).await?;
+    let schedule = schedule::load_schedule(&config, &csvs)
+        .map_err(|e| Error::RustError(e.to_string()))?;
 
     let now_denver = Utc::now().with_timezone(&Denver);
     let now_time = now_denver.time();
@@ -104,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    let output = Output {
+    Ok(Output {
         station: schedule.station_name,
         line: schedule.route_info.short_name,
         line_color: schedule.route_info.color,
@@ -112,9 +138,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         departures,
         alerts,
         updated_at: now_denver.to_rfc3339(),
-    };
+    })
+}
 
-    println!("{}", serde_json::to_string_pretty(&output)?);
+/// HTTP handler — returns departure JSON (useful for testing with `wrangler dev`).
+#[event(fetch)]
+async fn fetch(_req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    console_error_panic_hook::set_once();
 
-    Ok(())
+    let output = run(&env).await?;
+    let json = serde_json::to_string_pretty(&output)
+        .map_err(|e| Error::RustError(e.to_string()))?;
+
+    let mut headers = Headers::new();
+    headers.set("Content-Type", "application/json")?;
+
+    Ok(Response::ok(json)?.with_headers(headers))
+}
+
+/// Cron handler — dispatches based on which cron pattern triggered.
+/// - `*/15 * * * *` → compute departures (will POST to TRMNL webhook later)
+/// - `0 3 * * 1`   → refresh GTFS static data from RTD
+#[event(scheduled)]
+async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    console_error_panic_hook::set_once();
+
+    match event.cron().as_str() {
+        "0 3 * * 1" => {
+            if let Err(e) = refresh::refresh_gtfs(&env).await {
+                console_error!("GTFS refresh failed: {}", e);
+            }
+        }
+        _ => {
+            match run(&env).await {
+                Ok(output) => {
+                    match serde_json::to_string(&output) {
+                        Ok(json) => console_log!("{}", json),
+                        Err(e) => console_error!("JSON serialization error: {}", e),
+                    }
+                }
+                Err(e) => console_error!("Departure fetch error: {}", e),
+            }
+        }
+    }
 }

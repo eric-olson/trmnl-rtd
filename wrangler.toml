@@ -1,0 +1,19 @@
+name = "trmnl-rtd"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-12-01"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+[triggers]
+crons = [ "*/15 * * * *", "0 3 * * 1" ]
+
+[[r2_buckets]]
+binding = "GTFS_BUCKET"
+bucket_name = "trmnl-rtd-gtfs"
+
+[vars]
+GTFS_ROUTE_ID = "113G"
+GTFS_STOP_ID = "34510"
+GTFS_DIRECTION_ID = "0"
+GTFS_DEPARTURE_COUNT = "5"
