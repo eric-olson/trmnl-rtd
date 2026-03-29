@@ -142,9 +142,15 @@ async fn run(env: &Env) -> Result<Output> {
 }
 
 /// HTTP handler — returns departure JSON (useful for testing with `wrangler dev`).
+/// Append `?refresh` to trigger a manual GTFS refresh into R2.
 #[event(fetch)]
-async fn fetch(_req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
+
+    if req.url()?.query().unwrap_or_default().contains("refresh") {
+        refresh::refresh_gtfs(&env).await?;
+        return Response::ok("GTFS refresh complete");
+    }
 
     let output = run(&env).await?;
     let json = serde_json::to_string_pretty(&output)
