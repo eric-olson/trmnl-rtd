@@ -37,24 +37,49 @@ struct AlertOutput {
     description: String,
 }
 
-/// Load the GTFS CSV files from the R2 bucket.
-async fn load_gtfs_csvs(bucket: &Bucket) -> Result<GtfsCsvs> {
-    async fn get_csv(bucket: &Bucket, name: &str) -> Result<String> {
-        let obj = bucket.get(name).execute().await?
-            .ok_or_else(|| Error::RustError(format!("{} not found in R2 — run GTFS refresh first", name)))?;
-        obj.body()
-            .ok_or_else(|| Error::RustError(format!("{} has no body", name)))?
+async fn get_csv(bucket: &Bucket, key: &str) -> Result<String> {
+    let obj = bucket
+        .get(key)
+        .execute()
+        .await?
+        .ok_or_else(|| Error::RustError(format!("{} not found in R2 — run GTFS refresh first", key)))?;
+    obj.body()
+        .ok_or_else(|| Error::RustError(format!("{} has no body", key)))?
+        .text()
+        .await
+}
+
+async fn load_gtfs_csvs(bucket: &Bucket, slot: &str) -> Result<GtfsCsvs> {
+    Ok(GtfsCsvs {
+        routes: get_csv(bucket, &format!("{}/routes.txt", slot)).await?,
+        trips: get_csv(bucket, &format!("{}/trips.txt", slot)).await?,
+        stop_times: get_csv(bucket, &format!("{}/stop_times.txt", slot)).await?,
+        stops: get_csv(bucket, &format!("{}/stops.txt", slot)).await?,
+        calendar: get_csv(bucket, &format!("{}/calendar.txt", slot)).await?,
+    })
+}
+
+/// Attempts to load the pending schedule slot; returns None if it doesn't exist.
+async fn load_pending_csvs(bucket: &Bucket) -> Result<Option<GtfsCsvs>> {
+    async fn try_get_csv(bucket: &Bucket, key: &str) -> Result<Option<String>> {
+        let Some(obj) = bucket.get(key).execute().await? else {
+            return Ok(None);
+        };
+        let text = obj
+            .body()
+            .ok_or_else(|| Error::RustError(format!("{} has no body", key)))?
             .text()
-            .await
+            .await?;
+        Ok(Some(text))
     }
 
-    Ok(GtfsCsvs {
-        routes: get_csv(bucket, "routes.txt").await?,
-        trips: get_csv(bucket, "trips.txt").await?,
-        stop_times: get_csv(bucket, "stop_times.txt").await?,
-        stops: get_csv(bucket, "stops.txt").await?,
-        calendar: get_csv(bucket, "calendar.txt").await?,
-    })
+    let Some(routes) = try_get_csv(bucket, "pending/routes.txt").await? else { return Ok(None) };
+    let Some(trips) = try_get_csv(bucket, "pending/trips.txt").await? else { return Ok(None) };
+    let Some(stop_times) = try_get_csv(bucket, "pending/stop_times.txt").await? else { return Ok(None) };
+    let Some(stops) = try_get_csv(bucket, "pending/stops.txt").await? else { return Ok(None) };
+    let Some(calendar) = try_get_csv(bucket, "pending/calendar.txt").await? else { return Ok(None) };
+
+    Ok(Some(GtfsCsvs { routes, trips, stop_times, stops, calendar }))
 }
 
 /// Main logic: load schedule from R2, fetch realtime data, merge and return JSON output.
@@ -62,13 +87,26 @@ async fn run(env: &Env) -> Result<Output> {
     let config = Config::from_env(env);
     let bucket = env.bucket("GTFS_BUCKET")?;
 
-    let csvs = load_gtfs_csvs(&bucket).await?;
-    let schedule = schedule::load_schedule(&config, &csvs)
-        .map_err(|e| Error::RustError(e.to_string()))?;
-
     let now_denver = Utc::now().with_timezone(&Denver);
     let now_time = now_denver.time();
+    let today = now_denver.date_naive();
     let weekday = now_denver.weekday();
+
+    let csvs = load_gtfs_csvs(&bucket, "active").await?;
+    let schedule = schedule::load_schedule(&config, &csvs, Some(today))
+        .map_err(|e| Error::RustError(e.to_string()))?;
+
+    // If the active schedule has no services for today (e.g. gap between schedule periods),
+    // fall back to the pending schedule without date filtering.
+    let schedule = if schedule.is_empty() {
+        match load_pending_csvs(&bucket).await? {
+            Some(pending) => schedule::load_schedule(&config, &pending, None)
+                .map_err(|e| Error::RustError(e.to_string()))?,
+            None => schedule,
+        }
+    } else {
+        schedule
+    };
 
     let upcoming = schedule.upcoming_departures(now_time, weekday, config.departure_count);
 

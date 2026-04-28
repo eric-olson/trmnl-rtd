@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use chrono::{NaiveTime, Weekday};
+use chrono::{NaiveDate, NaiveTime, Weekday};
 use serde::Deserialize;
 
 use crate::config::Config;
@@ -49,6 +49,8 @@ struct GtfsCalendar {
     friday: u8,
     saturday: u8,
     sunday: u8,
+    start_date: String,
+    end_date: String,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +73,10 @@ pub struct Schedule {
 }
 
 impl Schedule {
+    pub fn is_empty(&self) -> bool {
+        self.departures_by_weekday.is_empty()
+    }
+
     pub fn upcoming_departures(
         &self,
         now_time: NaiveTime,
@@ -118,10 +124,11 @@ fn format_time_hhmm(t: NaiveTime) -> String {
 pub fn load_schedule(
     config: &Config,
     csvs: &GtfsCsvs,
+    today: Option<NaiveDate>,
 ) -> Result<Schedule, Box<dyn std::error::Error>> {
     let route_info = load_route_info(&csvs.routes, &config.route_id)?;
     let station_name = load_station_name(&csvs.stops, &config.stop_id)?;
-    let service_weekdays = load_calendar(&csvs.calendar)?;
+    let service_weekdays = load_calendar(&csvs.calendar, today)?;
     let (trips_by_service, headsign) =
         load_trips(&csvs.trips, &config.route_id, config.direction_id)?;
 
@@ -205,14 +212,28 @@ fn load_station_name(csv_data: &str, stop_id: &str) -> Result<String, Box<dyn st
     stop_name.ok_or_else(|| format!("Stop {} not found", stop_id).into())
 }
 
+fn parse_gtfs_date(s: &str) -> Option<NaiveDate> {
+    NaiveDate::parse_from_str(s.trim(), "%Y%m%d").ok()
+}
+
 fn load_calendar(
     csv_data: &str,
+    today: Option<NaiveDate>,
 ) -> Result<HashMap<String, Vec<Weekday>>, Box<dyn std::error::Error>> {
     let mut rdr = csv::Reader::from_reader(csv_data.as_bytes());
     let mut map = HashMap::new();
 
     for result in rdr.deserialize() {
         let cal: GtfsCalendar = result?;
+
+        if let Some(today) = today {
+            let Some(start) = parse_gtfs_date(&cal.start_date) else { continue };
+            let Some(end) = parse_gtfs_date(&cal.end_date) else { continue };
+            if today < start || today > end {
+                continue;
+            }
+        }
+
         let mut weekdays = Vec::new();
         if cal.monday == 1 { weekdays.push(Weekday::Mon); }
         if cal.tuesday == 1 { weekdays.push(Weekday::Tue); }
