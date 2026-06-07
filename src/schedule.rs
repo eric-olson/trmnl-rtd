@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{NaiveDate, NaiveTime, Weekday};
 use serde::Deserialize;
+use worker::{console_error, console_log};
 
 use crate::config::Config;
 
@@ -129,6 +130,7 @@ pub fn load_schedule(
     let route_info = load_route_info(&csvs.routes, &config.route_id)?;
     let station_name = load_station_name(&csvs.stops, &config.stop_id)?;
     let service_weekdays = load_calendar(&csvs.calendar, today)?;
+
     let (trips_by_service, headsign) =
         load_trips(&csvs.trips, &config.route_id, config.direction_id)?;
 
@@ -137,7 +139,20 @@ pub fn load_schedule(
         .flat_map(|ids| ids.iter().map(String::as_str))
         .collect();
 
-    let stop_times = load_stop_times(&csvs.stop_times, &all_trip_ids, &config.stop_id)?;
+    let (stop_times, seen_stop_ids) = load_stop_times(&csvs.stop_times, &all_trip_ids, &config.stop_id)?;
+
+    if stop_times.is_empty() && !seen_stop_ids.is_empty() {
+        // Stop ID is no longer in the schedule — log available stops to aid reconfiguration.
+        console_error!("[schedule] stop_id '{}' not found in new schedule", config.stop_id);
+        let mut rdr = csv::Reader::from_reader(csvs.stops.as_bytes());
+        for result in rdr.deserialize::<GtfsStop>() {
+            if let Ok(stop) = result {
+                if seen_stop_ids.contains(&stop.stop_id) {
+                    console_log!("[schedule] available stop: {} = '{}'", stop.stop_id, stop.stop_name);
+                }
+            }
+        }
+    }
 
     let mut departures_by_weekday: HashMap<Weekday, Vec<ScheduledDeparture>> = HashMap::new();
 
@@ -277,19 +292,29 @@ fn load_stop_times(
     csv_data: &str,
     trip_ids: &HashSet<&str>,
     stop_id: &str,
-) -> Result<HashMap<String, (NaiveTime, String)>, Box<dyn std::error::Error>> {
+) -> Result<(HashMap<String, (NaiveTime, String)>, HashSet<String>), Box<dyn std::error::Error>> {
     let mut rdr = csv::Reader::from_reader(csv_data.as_bytes());
     let mut map = HashMap::new();
+    let mut seen_stop_ids: HashSet<String> = HashSet::new();
 
     for result in rdr.deserialize() {
         let st: GtfsStopTime = result?;
-        if trip_ids.contains(st.trip_id.as_str()) && st.stop_id == stop_id {
-            if let Some(time) = parse_gtfs_time(&st.departure_time) {
-                let formatted = format_time_hhmm(time);
-                map.insert(st.trip_id, (time, formatted));
+        if trip_ids.contains(st.trip_id.as_str()) {
+            seen_stop_ids.insert(st.stop_id.clone());
+            if st.stop_id == stop_id {
+                if let Some(time) = parse_gtfs_time(&st.departure_time) {
+                    let formatted = format_time_hhmm(time);
+                    map.insert(st.trip_id, (time, formatted));
+                }
             }
         }
     }
 
-    Ok(map)
+    if map.is_empty() && !seen_stop_ids.is_empty() {
+        let mut ids: Vec<&str> = seen_stop_ids.iter().map(String::as_str).collect();
+        ids.sort();
+        console_log!("[schedule] stop_id '{}' not found; all stop_ids on these trips: {:?}", stop_id, ids);
+    }
+
+    Ok((map, seen_stop_ids))
 }

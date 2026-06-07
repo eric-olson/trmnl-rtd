@@ -92,6 +92,16 @@ async fn run(env: &Env) -> Result<Output> {
     let today = now_denver.date_naive();
     let weekday = now_denver.weekday();
 
+    // Promote pending → active if its schedule period has started.
+    if let Some(start) = refresh::pending_start_date(&bucket).await? {
+        if start <= today {
+            console_log!("[run] promoting pending (start={}) → active", start);
+            if let Err(e) = refresh::promote_pending_to_active(&bucket).await {
+                console_error!("[run] pending promotion failed: {}", e);
+            }
+        }
+    }
+
     let csvs = load_gtfs_csvs(&bucket, "active").await?;
     let schedule = schedule::load_schedule(&config, &csvs, Some(today))
         .map_err(|e| Error::RustError(e.to_string()))?;
@@ -99,10 +109,17 @@ async fn run(env: &Env) -> Result<Output> {
     // If the active schedule has no services for today (e.g. gap between schedule periods),
     // fall back to the pending schedule without date filtering.
     let schedule = if schedule.is_empty() {
+        console_log!("[run] active schedule empty for today; trying pending fallback");
         match load_pending_csvs(&bucket).await? {
-            Some(pending) => schedule::load_schedule(&config, &pending, None)
-                .map_err(|e| Error::RustError(e.to_string()))?,
-            None => schedule,
+            Some(pending) => {
+                console_log!("[run] pending fallback loaded");
+                schedule::load_schedule(&config, &pending, None)
+                    .map_err(|e| Error::RustError(e.to_string()))?
+            }
+            None => {
+                console_error!("[run] no schedule data available for today={} weekday={:?}", today, weekday);
+                schedule
+            }
         }
     } else {
         schedule
@@ -111,6 +128,7 @@ async fn run(env: &Env) -> Result<Output> {
     let upcoming = schedule.upcoming_departures(now_time, weekday, config.departure_count);
 
     let realtime = gtfs_rt::fetch_realtime(&config).await?;
+    console_log!("[run] departures={} rt={} alerts={}", upcoming.len(), realtime.departures.len(), realtime.alerts.len());
 
     // Index RT departures by trip_id for quick lookup
     let rt_by_trip: HashMap<&str, &gtfs_rt::RealtimeDeparture> = realtime
@@ -194,7 +212,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let json = serde_json::to_string_pretty(&output)
         .map_err(|e| Error::RustError(e.to_string()))?;
 
-    let mut headers = Headers::new();
+    let headers = Headers::new();
     headers.set("Content-Type", "application/json")?;
 
     Ok(Response::ok(json)?.with_headers(headers))
